@@ -49,12 +49,13 @@ def _build_dataframe_row(group, stream, idx, comp_names, has_time):
             row["time"] = group["time"][idx]
 
     # copy all top‑level datasets except the composition group
-    for key, val in group.items():
+    for key, val in group.members():
         if key in ("time", "__composition__"):
             continue
         try:
-            # handle indexed arrays
-            row[key] = val[idx] if hasattr(val, "shape") and val.shape else val
+            # handle indexed arrays; zarr v3 returns 0-d ndarray on scalar index
+            v = val[idx] if hasattr(val, "shape") and val.shape else val
+            row[key] = v.item() if hasattr(v, "item") else v
         except Exception:
             row[key] = val
 
@@ -66,13 +67,33 @@ def _build_dataframe_row(group, stream, idx, comp_names, has_time):
                 row[comp] = 0.0
             else:
                 try:
-                    row[comp] = arr[idx] if has_time else arr
+                    v = arr[idx] if has_time else arr
+                    row[comp] = v.item() if hasattr(v, "item") else v
                 except Exception:
                     row[comp] = arr
     return row
 
 
 # utilities for fetching zarr stores ----------------------------------------
+
+_S3_ENV_VARS = (
+    "S3_ACCESS_KEY",
+    "S3_SECRET_KEY",
+    "S3_REGION_NAME",
+    "S3_ENDPOINT_URL",
+    "S3_BUCKET_NAME",
+)
+
+
+def _check_s3_env_vars():
+    missing = [v for v in _S3_ENV_VARS if not os.environ.get(v)]
+    if missing:
+        logger.warning(
+            "S3 environment variables not set: {}. "
+            "S3 access may fail. Consider setting LOCAL_ZARR_DIR instead.",
+            ", ".join(missing),
+        )
+    return missing
 
 
 def download_zarr_from_s3(s3_url: str, dest_dir: str) -> str:
@@ -83,11 +104,19 @@ def download_zarr_from_s3(s3_url: str, dest_dir: str) -> str:
     under ``dest_dir`` preserving the relative structure.  The
     returned string is ``dest_dir`` itself.
     """
+    _check_s3_env_vars()
+
     parsed = urllib.parse.urlparse(s3_url)
     bucket = parsed.netloc
     prefix = parsed.path.lstrip("/")
 
-    s3 = boto3.client("s3")
+    s3 = boto3.client(
+        "s3",
+        aws_access_key_id=os.environ.get("S3_ACCESS_KEY"),
+        aws_secret_access_key=os.environ.get("S3_SECRET_KEY"),
+        region_name=os.environ.get("S3_REGION_NAME"),
+        endpoint_url=os.environ.get("S3_ENDPOINT_URL"),
+    )
     paginator = s3.get_paginator("list_objects_v2")
     for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
         for obj in page.get("Contents", []):
@@ -101,16 +130,16 @@ def download_zarr_from_s3(s3_url: str, dest_dir: str) -> str:
     return dest_dir
 
 
-def fetch_zarr_store(source: str):
+def fetch_zarr_store(source: str | None = None):
     """Return a local path to a Zarr store, downloading if necessary.
 
     Parameters
     ----------
-    source : str
-        Either a local filesystem path or a URL.  Supported schemes are
-        ``s3://``, ``http://`` and ``https://``.  For HTTP(S) the URL is
-        expected to point to a ``.zip`` archive containing a zarr
-        directory (vault) or to a bare zarr directory (not commonly used).
+    source : str or None
+        Local filesystem path, or a URL with scheme ``s3://``, ``http://``,
+        or ``https://``.  If *None*, the function falls back to the
+        ``LOCAL_ZARR_DIR`` environment variable, then to an S3 URL built
+        from ``S3_BUCKET_NAME``.
 
     Returns
     -------
@@ -120,6 +149,20 @@ def fetch_zarr_store(source: str):
         removed by the caller (or ``None`` if the path is the original
         ``source`` and does not need cleanup).
     """
+    if source is None:
+        local_dir = os.environ.get("LOCAL_ZARR_DIR")
+        s3_bucket = os.environ.get("S3_BUCKET_NAME")
+        if local_dir:
+            logger.info("Using LOCAL_ZARR_DIR: {}", local_dir)
+            source = local_dir
+        elif s3_bucket:
+            source = f"s3://{s3_bucket}"
+        else:
+            raise ValueError(
+                "No source provided. Pass a path/URL argument or set "
+                "LOCAL_ZARR_DIR or S3_BUCKET_NAME environment variables."
+            )
+
     # local directory
     if os.path.isdir(source):
         return source, None
@@ -205,6 +248,15 @@ class ProcessForgeValidator:
 
         if "Stream" in df.columns and "stream" not in df.columns:
             df.rename(columns={"Stream": "stream"}, inplace=True)
+
+        # normalise bare unit-less column names produced by zarr stores
+        rename_map = {}
+        if "P" in df.columns and "P [Pa]" not in df.columns:
+            rename_map["P"] = "P [Pa]"
+        if "T" in df.columns and "T [K]" not in df.columns:
+            rename_map["T"] = "T [K]"
+        if rename_map:
+            df.rename(columns=rename_map, inplace=True)
 
         known_cols = {
             "time",
@@ -309,7 +361,12 @@ def main():
     )
     parser.add_argument(
         "source",
-        help="Local directory or URL (s3://, http(s)://) pointing to a zarr store",
+        nargs="?",
+        default=None,
+        help=(
+            "Local directory or URL (s3://, http(s)://) pointing to a zarr store. "
+            "If omitted, LOCAL_ZARR_DIR or S3_BUCKET_NAME env vars are used."
+        ),
     )
     parser.add_argument(
         "-o",
