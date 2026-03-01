@@ -26,28 +26,12 @@ classifiers = [
 keywords = ["process", "simulation", "chemical", "engineering", "flowsheet"]
 dependencies = [
     "numpy>=2.0",
-    "scipy>=1.14",
-    "coolprop>=6.6",
-    "matplotlib>=3.9",
+    "scipy>=1.14",    
     "loguru>=0.7",
     "jsonschema>=4.20",
-    "graphviz>=0.20",
-    "pandas>=2.2",
     "openpyxl>=3.1",
     "zarr>=3.0",
     "boto3>=1.28",
-]
-
-dev = [
-    "pytest>=7.0",
-    "black",
-    "flake8",
-    "build",
-    "twine",
-]
-docs = [
-    "sphinx",
-    "sphinx-rtd-theme",
 ]
 
 [project.urls]

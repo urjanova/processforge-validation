@@ -9,6 +9,7 @@ import zipfile
 
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
 import zarr
 import boto3
 import requests
@@ -132,7 +133,7 @@ def fetch_zarr_store(source: str):
         return tmp, tmp
 
     elif scheme in ("http", "https"):  # download file
-        response = requests.get(source, stream=True, timeout=30)
+        response = requests.get(source, stream=True)
         response.raise_for_status()
         fname = os.path.basename(parsed.path)
         tmpfile = tempfile.NamedTemporaryFile(
@@ -159,8 +160,8 @@ def fetch_zarr_store(source: str):
 
 
 class ProcessForgeValidator:
-    def __init__(self, custom_logger=None):
-        self.logger = custom_logger or logging.getLogger(__name__)
+    def __init__(self, logger=None):
+        self.logger = logger or logging.getLogger(__name__)
 
     def _load_dataframe_from_zarr(self, store_path):
         store = zarr.storage.LocalStore(store_path)
