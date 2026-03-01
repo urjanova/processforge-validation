@@ -1,0 +1,66 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "processforge-validation"
+version = "0.2.4"
+description = "Validation of Processforge outputs."
+readme = "README.md"
+license = "BSD-3-Clause"
+license-files = ["LICENSE"]
+requires-python = ">=3.12"
+authors = [
+    {name = "Process Forge Team", email = "team@processforge.dev"},
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Chemistry",
+    "Topic :: Scientific/Engineering",
+]
+keywords = ["process", "simulation", "chemical", "engineering", "flowsheet"]
+dependencies = [
+    "numpy>=2.0",
+    "scipy>=1.14",
+    "coolprop>=6.6",
+    "matplotlib>=3.9",
+    "loguru>=0.7",
+    "jsonschema>=4.20",
+    "graphviz>=0.20",
+    "pandas>=2.2",
+    "openpyxl>=3.1",
+    "zarr>=3.0",
+    "boto3>=1.28",
+]
+
+dev = [
+    "pytest>=7.0",
+    "black",
+    "flake8",
+    "build",
+    "twine",
+]
+docs = [
+    "sphinx",
+    "sphinx-rtd-theme",
+]
+
+[project.urls]
+Homepage = "https://github.com/urjanova/processforge-validation"
+Repository = "https://github.com/urjanova/processforge-validation"
+Issues = "https://github.com/urjanova/processforge-validation/issues"
+
+[project.scripts]
+processforge = "processforge.simulate:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["processforge*"]
+
+[tool.setuptools.package-data]
+"processforge.schemas" = ["*.json"]
