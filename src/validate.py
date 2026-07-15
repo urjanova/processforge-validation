@@ -209,7 +209,9 @@ class ProcessForgeValidator:
     def _load_dataframe_from_zarr(self, store_path):
         store = zarr.storage.LocalStore(store_path)
         root = zarr.open(store=store, mode="r")
-        streams = sorted(root.group_keys())
+        # only groups carrying a composition are streams; others (e.g. run_info)
+        # are metadata
+        streams = sorted(k for k in root.group_keys() if "__composition__" in root[k])
         rows = []
         components = set()
         mode = root.attrs.get("mode", "steady")
@@ -230,6 +232,7 @@ class ProcessForgeValidator:
                 df[comp] = df[comp].fillna(0.0)
             else:
                 df[comp] = 0.0
+        df.attrs["components"] = sorted(components)
         return df
 
     def generate_validation_excel(self, data_source, output_filename):
@@ -267,7 +270,11 @@ class ProcessForgeValidator:
             "VaporFrac",
             "flowrate",
         }
-        comp_cols = [c for c in df.columns if c not in known_cols]
+        # zarr stores name their components explicitly; CSVs fall back to
+        # "anything not a known column"
+        comp_cols = df.attrs.get("components") or [
+            c for c in df.columns if c not in known_cols
+        ]
         numeric_comp = (
             df[comp_cols].apply(pd.to_numeric, errors="coerce")
             if comp_cols
@@ -288,18 +295,21 @@ class ProcessForgeValidator:
         pump_check = pd.DataFrame()
         pump_ok = True
         temp_ok = True
+        unpaired_pumps = []
 
         if "stream" in df.columns and "time" in df.columns:
             stream_names = df["stream"].unique()
             pump_ins = sorted([s for s in stream_names if "before_pump" in str(s)])
             pump_outs = sorted([s for s in stream_names if "after_pump" in str(s)])
 
+            paired_outs = set()
             for p_in, p_out in zip(pump_ins, pump_outs):
                 df_in = df[df["stream"] == p_in].set_index("time")
                 df_out = df[df["stream"] == p_out].set_index("time")
                 common_idx = df_in.index.intersection(df_out.index)
                 if common_idx.empty:
                     continue
+                paired_outs.add(p_out)
                 pc = pd.DataFrame(index=common_idx)
                 pc["Pump"] = f"{p_in} -> {p_out}"
                 pc["Pressure_Gain_Pa"] = (
@@ -321,6 +331,16 @@ class ProcessForgeValidator:
                 pump_ok = (pump_check["Pump_Status"] == "Functional").all()
                 temp_ok = (pump_check["Temp_Rise_K"] >= 0).all()
 
+            unpaired_pumps = sorted(set(pump_outs) - paired_outs)
+            if unpaired_pumps:
+                logger.warning(
+                    "No inlet stream found for {}: pump checks skipped. "
+                    "Pump inlets are matched by name, so each '{}' outlet needs a "
+                    "matching 'before_pump*' inlet stream.",
+                    ", ".join(unpaired_pumps),
+                    "after_pump*",
+                )
+
         summary_rows = [
             {
                 "Physical Law": "Conservation of Mass",
@@ -341,6 +361,18 @@ class ProcessForgeValidator:
                     "Physical Law": "Thermal Direction",
                     "Logic": "Is the outlet temperature >= inlet?",
                     "Status": "PASS" if temp_ok else "WARNING",
+                }
+            )
+        if unpaired_pumps:
+            summary_rows.append(
+                {
+                    "Physical Law": "Pump Work (Pressure)",
+                    "Logic": (
+                        "No inlet stream found for "
+                        f"{', '.join(unpaired_pumps)}; expected a 'before_pump*' "
+                        "stream to compare against"
+                    ),
+                    "Status": "SKIPPED",
                 }
             )
         summary_df = pd.DataFrame(summary_rows)
