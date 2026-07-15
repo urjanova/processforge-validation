@@ -67,7 +67,7 @@ def _build_dataframe_row(group, stream, idx, comp_names, has_time):
                 row[comp] = 0.0
             else:
                 try:
-                    v = arr[idx] if has_time else arr
+                    v = arr[idx]
                     row[comp] = v.item() if hasattr(v, "item") else v
                 except Exception:
                     row[comp] = arr

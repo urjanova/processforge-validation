@@ -19,42 +19,42 @@ class TestProcessForgeValidator(unittest.TestCase):
         self.store_path = os.path.join(self.test_dir, "test_store.zarr")
         self.output_file = os.path.join(self.test_dir, "validation.xlsx")
 
-        # Create a dummy zarr store
-        store = zarr.DirectoryStore(self.store_path)
-        root = zarr.group(store=store)
+        # Create a dummy zarr store (v3 API)
+        store = zarr.storage.LocalStore(self.store_path)
+        root = zarr.open_group(store=store, mode='w')
         
         # Attribute 'mode'
         root.attrs["mode"] = "steady"
 
         # Stream 1
         s1 = root.create_group("stream1")
-        s1.create_dataset("T [K]", data=np.array([300.0]))
-        s1.create_dataset("P [Pa]", data=np.array([101325.0]))
-        s1.create_dataset("Phase", data=np.array(["Liquid"], dtype='<U10'))
-        s1.create_dataset("VaporFrac", data=np.array([0.0]))
-        s1.create_dataset("flowrate", data=np.array([10.0]))
+        s1.create_array("T [K]", data=np.array([300.0]))
+        s1.create_array("P [Pa]", data=np.array([101325.0]))
+        s1.create_array("Phase", data=np.array(["Liquid"], dtype='<U10'))
+        s1.create_array("VaporFrac", data=np.array([0.0]))
+        s1.create_array("flowrate", data=np.array([10.0]))
         comp1 = s1.create_group("__composition__")
-        comp1.create_dataset("Water", data=np.array([1.0]))
+        comp1.create_array("Water", data=np.array([1.0]))
 
         # Stream 2 (pump outlet)
         s2 = root.create_group("stream2_after_pump")
-        s2.create_dataset("T [K]", data=np.array([305.0]))
-        s2.create_dataset("P [Pa]", data=np.array([200000.0])) # higher pressure
-        s2.create_dataset("Phase", data=np.array(["Liquid"], dtype='<U10'))
-        s2.create_dataset("VaporFrac", data=np.array([0.0]))
-        s2.create_dataset("flowrate", data=np.array([10.0]))
+        s2.create_array("T [K]", data=np.array([305.0]))
+        s2.create_array("P [Pa]", data=np.array([200000.0])) # higher pressure
+        s2.create_array("Phase", data=np.array(["Liquid"], dtype='<U10'))
+        s2.create_array("VaporFrac", data=np.array([0.0]))
+        s2.create_array("flowrate", data=np.array([10.0]))
         comp2 = s2.create_group("__composition__")
-        comp2.create_dataset("Water", data=np.array([1.0]))
+        comp2.create_array("Water", data=np.array([1.0]))
         
         # Stream 3 (failed mass balance)
         s3 = root.create_group("stream3")
-        s3.create_dataset("T [K]", data=np.array([300.0]))
-        s3.create_dataset("P [Pa]", data=np.array([101325.0]))
-        s3.create_dataset("Phase", data=np.array(["Liquid"], dtype='<U10'))
-        s3.create_dataset("VaporFrac", data=np.array([0.0]))
-        s3.create_dataset("flowrate", data=np.array([5.0]))
+        s3.create_array("T [K]", data=np.array([300.0]))
+        s3.create_array("P [Pa]", data=np.array([101325.0]))
+        s3.create_array("Phase", data=np.array(["Liquid"], dtype='<U10'))
+        s3.create_array("VaporFrac", data=np.array([0.0]))
+        s3.create_array("flowrate", data=np.array([5.0]))
         comp3 = s3.create_group("__composition__")
-        comp3.create_dataset("Water", data=np.array([0.5])) # incomplete fraction
+        comp3.create_array("Water", data=np.array([0.5])) # incomplete fraction
 
     def tearDown(self):
         shutil.rmtree(self.test_dir)
@@ -94,9 +94,9 @@ class TestFetchZarrStore(unittest.TestCase):
         self.test_dir = tempfile.mkdtemp()
         self.zip_path = os.path.join(self.test_dir, "store.zip")
         
-        # Create dummy zip with a file inside
-        with zarr.ZipStore(self.zip_path, mode='w') as store:
-            root = zarr.group(store=store)
+        # Create dummy zip with a file inside (zarr v3 API)
+        with zarr.storage.ZipStore(self.zip_path, mode='w') as store:
+            root = zarr.open_group(store=store, mode='w')
             root.create_group("s1")
 
     def tearDown(self):
