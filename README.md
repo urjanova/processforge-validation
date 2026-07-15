@@ -21,9 +21,7 @@ This package requires Python 3.12+ and the dependencies listed in `pyproject.tom
 
 2. Install dependencies:
    ```bash
-   pip install -r requirements.txt
-   # OR use the project file directly if using a tool like poetry/pdm, or install manually:
-   pip install numpy pandas zarr boto3 requests openpyxl loguru coolprop matplotlib
+   uv sync
    ```
 
 ## Configuration
@@ -44,7 +42,7 @@ Copy `.env.example` to `.env` and fill in the values for your environment.
 ## Usage
 
 ```bash
-python validate.py [SOURCE] [-o OUTPUT]
+uv run processforge-validate [SOURCE] [-o OUTPUT]
 ```
 
 ### Arguments
@@ -60,28 +58,28 @@ python validate.py [SOURCE] [-o OUTPUT]
 
 **Local directory (explicit path)**
 ```bash
-python validate.py ./dataset.zarr
+uv run processforge-validate ./dataset.zarr
 ```
 
 **Local directory (via env var — no argument needed)**
 ```bash
-LOCAL_ZARR_DIR=./dataset.zarr python validate.py
+LOCAL_ZARR_DIR=./dataset.zarr uv run processforge-validate
 ```
 
 **S3 URL**
 ```bash
-python validate.py s3://processforge-data/run_01.zarr -o report_01.xlsx
+uv run processforge-validate s3://processforge-data/run_01.zarr -o report_01.xlsx
 ```
 
 **S3 via env var — no argument needed**
 ```bash
 # S3_* vars set in .env
-python validate.py
+uv run processforge-validate
 ```
 
 **HTTP zip archive**
 ```bash
-python validate.py https://example.com/data/sim_result.zip
+uv run processforge-validate https://example.com/data/sim_result.zip
 ```
 
 ## Output

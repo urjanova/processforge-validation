@@ -26,12 +26,16 @@ classifiers = [
 keywords = ["process", "simulation", "chemical", "engineering", "flowsheet"]
 dependencies = [
     "numpy>=2.0",
+    "pandas>=2.0",
     "scipy>=1.14",    
     "loguru>=0.7",
     "jsonschema>=4.20",
     "openpyxl>=3.1",
     "zarr>=3.0",
     "boto3>=1.28",
+    "requests>=2.31",
+    "coolprop>=6.6",
+    "matplotlib>=3.8",
 ]
 
 [project.urls]
@@ -41,6 +45,7 @@ Issues = "https://github.com/urjanova/processforge-validation/issues"
 
 [project.scripts]
 processforge = "processforge.simulate:main"
+processforge-validate = "validate:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
