@@ -6,6 +6,7 @@ import tempfile
 import shutil
 import urllib.parse
 import zipfile
+import glob
 
 import numpy as np
 import pandas as pd
@@ -13,6 +14,7 @@ import matplotlib.pyplot as plt
 import zarr
 import boto3
 import requests
+import json
 
 
 # helper utilities -----------------------------------------------------------
@@ -94,6 +96,20 @@ def _check_s3_env_vars():
             ", ".join(missing),
         )
     return missing
+
+
+def _load_schema(store_path: str) -> dict | None:
+    """Load a schema JSON file that sits alongside a zarr store.
+
+    Convention: ``<store_path>.schema.json`` is loaded if it exists.
+    Returns ``None`` when no schema file is found.
+    """
+    schema_path = store_path + ".schema.json"
+    if os.path.exists(schema_path):
+        logger.info("Found schema: {}", schema_path)
+        with open(schema_path) as f:
+            return json.load(f)
+    return None
 
 
 def download_zarr_from_s3(s3_url: str, dest_dir: str) -> str:
@@ -206,11 +222,64 @@ class ProcessForgeValidator:
     def __init__(self, logger=None):
         self.logger = logger or logging.getLogger(__name__)
 
-    def _load_dataframe_from_zarr(self, store_path):
+    def _load_dataframe_from_zarr(self, store_path, schema=None):
         store = zarr.storage.LocalStore(store_path)
         root = zarr.open(store=store, mode="r")
-        # only groups carrying a composition are streams; others (e.g. run_info)
-        # are metadata
+
+        if schema is not None:
+            # Schema-driven: use schema for stream/variable discovery
+            stream_defs = schema.get("streams", {})
+            rows = []
+            comp_set = set()
+            std_vars = {"P", "T", "flowrate", "Phase", "VaporFrac"}
+
+            for stream_name in sorted(stream_defs):
+                info = stream_defs[stream_name]
+                variables = info.get("variables", [])
+                has_time = info.get("has_time", False)
+                comp_names = sorted(v for v in variables if v not in std_vars)
+                comp_set.update(comp_names)
+
+                group = root.get(stream_name)
+                if group is None:
+                    continue
+
+                length = group["time"].shape[0] if has_time and "time" in group else 1
+                for idx in range(length):
+                    row = {"stream": stream_name}
+                    if has_time and "time" in group:
+                        try:
+                            row["time"] = float(group["time"][idx])
+                        except Exception:
+                            row["time"] = group["time"][idx]
+
+                    for var in variables:
+                        if var == "time":
+                            continue
+                        arr = group.get(var)
+                        if arr is None:
+                            continue
+                        try:
+                            v = arr[idx] if hasattr(arr, "shape") and arr.shape else arr
+                            row[var] = v.item() if hasattr(v, "item") else v
+                        except Exception:
+                            row[var] = arr
+
+                    for comp in comp_names:
+                        row.setdefault(comp, 0.0)
+
+                    rows.append(row)
+
+            df = pd.DataFrame(rows)
+            for comp in sorted(comp_set):
+                if comp in df:
+                    df[comp] = df[comp].fillna(0.0)
+                else:
+                    df[comp] = 0.0
+            df.attrs["components"] = sorted(comp_set)
+            return df
+
+        # Fallback: heuristic discovery using __composition__ sub-groups
         streams = sorted(k for k in root.group_keys() if "__composition__" in root[k])
         rows = []
         components = set()
@@ -235,15 +304,72 @@ class ProcessForgeValidator:
         df.attrs["components"] = sorted(components)
         return df
 
+    def _validate_against_schema(self, store_path, schema):
+        issues = []
+        store = zarr.storage.LocalStore(store_path)
+        root = zarr.open(store=store, mode="r")
+
+        for stream_name in schema.get("streams", {}):
+            if stream_name not in root:
+                issues.append(f"Missing stream: '{stream_name}'")
+
+        for stream_name, stream_info in schema.get("streams", {}).items():
+            if stream_name not in root:
+                continue
+            group = root[stream_name]
+            for var_name in stream_info.get("variables", []):
+                if var_name not in group:
+                    issues.append(
+                        f"Stream '{stream_name}': missing variable '{var_name}'"
+                    )
+
+        zarr_mode = root.attrs.get("mode")
+        schema_mode = schema.get("mode")
+        if zarr_mode and schema_mode and zarr_mode != schema_mode:
+            issues.append(
+                f"Mode mismatch: schema='{schema_mode}', zarr='{zarr_mode}'"
+            )
+
+        return issues
+
     def generate_validation_excel(self, data_source, output_filename):
         """
         Generate a multi-sheet Excel validation report from simulation results.
 
-        data_source: path to a Zarr store, CSV file, or pandas DataFrame.
+        data_source: path to a Zarr store or a directory containing one;
+                     path to a CSV file; or a pandas DataFrame.
+                     When a directory is given, a ``.schema.json`` file is
+                     used to discover the matching ``.zarr`` store inside it.
         output_filename: path for the output .xlsx file.
         """
+        schema = None
         if isinstance(data_source, str) and os.path.isdir(data_source):
-            df = self._load_dataframe_from_zarr(data_source)
+            schema_files = sorted(
+                glob.glob(os.path.join(data_source, "*.schema.json"))
+            )
+            if len(schema_files) == 0:
+                # No schemas found inside the directory.  Fall back to
+                # looking for a sidecar schema alongside data_source
+                # (backward compat for direct .zarr paths).
+                schema = _load_schema(data_source)
+                store_path = data_source
+            elif len(schema_files) == 1:
+                schema_path = schema_files[0]
+                basename = os.path.basename(schema_path)
+                store_name = basename.removesuffix(".schema.json")
+                store_path = os.path.join(data_source, store_name)
+                schema = _load_schema(store_path)
+                if not os.path.isdir(store_path):
+                    raise FileNotFoundError(
+                        f"Schema {basename} expects a Zarr store at "
+                        f"{store_name}, but that directory does not exist."
+                    )
+            else:
+                raise ValueError(
+                    f"Multiple schema files found in {data_source}. "
+                    f"Please point directly to the desired .zarr directory."
+                )
+            df = self._load_dataframe_from_zarr(store_path, schema=schema)
         elif isinstance(data_source, str):
             df = pd.read_csv(data_source)
         else:
@@ -252,26 +378,43 @@ class ProcessForgeValidator:
         if "Stream" in df.columns and "stream" not in df.columns:
             df.rename(columns={"Stream": "stream"}, inplace=True)
 
-        # normalise bare unit-less column names produced by zarr stores
+        # Schema-aware column renaming: P -> P [Pa], flowrate -> flowrate [mol/s], ...
         rename_map = {}
-        if "P" in df.columns and "P [Pa]" not in df.columns:
-            rename_map["P"] = "P [Pa]"
-        if "T" in df.columns and "T [K]" not in df.columns:
-            rename_map["T"] = "T [K]"
+        if schema is not None:
+            units_map = {}
+            for s_info in schema.get("streams", {}).values():
+                for var, unit in s_info.get("units", {}).items():
+                    if var not in units_map:
+                        units_map[var] = unit
+            for var, unit in units_map.items():
+                if unit:
+                    col = f"{var} [{unit}]"
+                    if var in df.columns and col not in df.columns:
+                        rename_map[var] = col
+        else:
+            if "P" in df.columns and "P [Pa]" not in df.columns:
+                rename_map["P"] = "P [Pa]"
+            if "T" in df.columns and "T [K]" not in df.columns:
+                rename_map["T"] = "T [K]"
         if rename_map:
             df.rename(columns=rename_map, inplace=True)
 
-        known_cols = {
-            "time",
-            "stream",
-            "T [K]",
-            "P [Pa]",
-            "Phase",
-            "VaporFrac",
-            "flowrate",
-        }
-        # zarr stores name their components explicitly; CSVs fall back to
-        # "anything not a known column"
+        if schema is not None:
+            known_cols = {"time", "stream"}
+            for s_info in schema.get("streams", {}).values():
+                for var, unit in s_info.get("units", {}).items():
+                    if var in ("P", "T", "flowrate", "Phase", "VaporFrac"):
+                        known_cols.add(f"{var} [{unit}]" if unit else var)
+        else:
+            known_cols = {
+                "time",
+                "stream",
+                "T [K]",
+                "P [Pa]",
+                "Phase",
+                "VaporFrac",
+                "flowrate",
+            }
         comp_cols = df.attrs.get("components") or [
             c for c in df.columns if c not in known_cols
         ]
@@ -341,13 +484,51 @@ class ProcessForgeValidator:
                     "after_pump*",
                 )
 
-        summary_rows = [
+        # Schema validation against the store
+        schema_issues = []
+        schema_ok = True
+        if schema is not None and isinstance(data_source, str) and os.path.isdir(data_source):
+            schema_issues = self._validate_against_schema(store_path, schema)
+            schema_ok = not schema_issues
+
+        summary_rows = []
+        if schema is not None:
+            summary_rows.append(
+                {
+                    "Physical Law": "Schema Compliance",
+                    "Logic": "Does the zarr store match its schema?",
+                    "Status": "PASS" if schema_ok else "FAIL",
+                }
+            )
+            for issue in schema_issues:
+                summary_rows.append(
+                    {
+                        "Physical Law": "Schema Issue",
+                        "Logic": issue,
+                        "Status": "INFO",
+                    }
+                )
+            summary_rows.append(
+                {
+                    "Physical Law": "Simulation Mode",
+                    "Logic": schema.get("mode", "unknown"),
+                    "Status": "INFO",
+                }
+            )
+            summary_rows.append(
+                {
+                    "Physical Law": "ProcessForge Version",
+                    "Logic": schema.get("processforge_version", "unknown"),
+                    "Status": "INFO",
+                }
+            )
+        summary_rows.append(
             {
                 "Physical Law": "Conservation of Mass",
                 "Logic": "Do chemical fractions add to 1.0?",
                 "Status": "PASS" if mass_ok else "FAIL",
             }
-        ]
+        )
         if not pump_check.empty:
             summary_rows.append(
                 {
@@ -379,6 +560,29 @@ class ProcessForgeValidator:
 
         _ensure_parent_dir(output_filename)
         with pd.ExcelWriter(output_filename, engine="openpyxl") as writer:
+            if schema is not None:
+                schema_info = pd.DataFrame(
+                    [
+                        {"Property": "Mode", "Value": schema.get("mode", "")},
+                        {
+                            "Property": "ProcessForge Version",
+                            "Value": schema.get("processforge_version", ""),
+                        },
+                        {
+                            "Property": "Backend",
+                            "Value": schema.get("provenance", {}).get("backend", ""),
+                        },
+                        {
+                            "Property": "Git Hash",
+                            "Value": schema.get("provenance", {}).get("git_hash", ""),
+                        },
+                        {
+                            "Property": "Created",
+                            "Value": schema.get("created", ""),
+                        },
+                    ]
+                )
+                schema_info.to_excel(writer, sheet_name="0_SCHEMA_INFO", index=False)
             summary_df.to_excel(writer, sheet_name="1_EXECUTIVE_SUMMARY", index=False)
             if not pump_check.empty:
                 pump_check.to_excel(writer, sheet_name="2_PUMP_PERFORMANCE")

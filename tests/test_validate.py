@@ -1,3 +1,4 @@
+import json
 import os
 import shutil
 import tempfile
@@ -11,7 +12,7 @@ import zarr
 # Add the parent directory to the path so we can import the module
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from validate import ProcessForgeValidator, fetch_zarr_store
+from validate import ProcessForgeValidator, fetch_zarr_store, _load_schema
 
 class TestProcessForgeValidator(unittest.TestCase):
     def setUp(self):
@@ -153,6 +154,239 @@ class TestFetchZarrStore(unittest.TestCase):
         
         # Cleanup
         shutil.rmtree(tmp)
+
+class TestSchemaIntegration(unittest.TestCase):
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.store_path = os.path.join(self.test_dir, "test_schema.zarr")
+        self.output_file = os.path.join(self.test_dir, "schema_report.xlsx")
+
+        # Create a zarr store with bare variable names (real output format)
+        store = zarr.storage.LocalStore(self.store_path)
+        root = zarr.open_group(store=store, mode='w')
+
+        s1 = root.create_group("feed")
+        s1.create_array("P", data=np.array([101325.0]))
+        s1.create_array("T", data=np.array([300.0]))
+        s1.create_array("Water", data=np.array([1.0]))
+        s1.create_array("flowrate", data=np.array([10.0]))
+
+        s2 = root.create_group("product")
+        s2.create_array("P", data=np.array([101325.0]))
+        s2.create_array("T", data=np.array([300.0]))
+        s2.create_array("Water", data=np.array([1.0]))
+        s2.create_array("flowrate", data=np.array([10.0]))
+
+        # Write schema JSON alongside the store
+        self.schema = {
+            "version": 1,
+            "mode": "steady",
+            "processforge_version": "0.3.0",
+            "streams": {
+                "feed": {
+                    "variables": ["P", "T", "flowrate", "Water"],
+                    "dtypes": {
+                        "P": "float64",
+                        "T": "float64",
+                        "flowrate": "float64",
+                        "Water": "float64",
+                    },
+                    "units": {
+                        "P": "Pa",
+                        "T": "K",
+                        "flowrate": "mol/s",
+                        "Water": "",
+                    },
+                    "has_time": False,
+                    "has_phase": False,
+                },
+                "product": {
+                    "variables": ["P", "T", "flowrate", "Water"],
+                    "dtypes": {
+                        "P": "float64",
+                        "T": "float64",
+                        "flowrate": "float64",
+                        "Water": "float64",
+                    },
+                    "units": {
+                        "P": "Pa",
+                        "T": "K",
+                        "flowrate": "mol/s",
+                        "Water": "",
+                    },
+                    "has_time": False,
+                    "has_phase": False,
+                },
+            },
+            "provenance": {
+                "backend": "scipy",
+                "git_hash": "abc123",
+            },
+        }
+        with open(self.store_path + ".schema.json", "w") as f:
+            json.dump(self.schema, f)
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir)
+
+    def test_schema_based_loading_uses_bare_names(self):
+        validator = ProcessForgeValidator()
+        df = validator._load_dataframe_from_zarr(self.store_path, schema=self.schema)
+        self.assertEqual(len(df), 2)  # feed + product
+        self.assertIn("stream", df.columns)
+        self.assertIn("P", df.columns)
+        self.assertIn("T", df.columns)
+        self.assertIn("Water", df.columns)
+        self.assertIn("flowrate", df.columns)
+
+    def test_schema_column_renaming_uses_units(self):
+        validator = ProcessForgeValidator()
+        validator.generate_validation_excel(self.store_path, self.output_file)
+        self.assertTrue(os.path.exists(self.output_file))
+
+        xl = pd.ExcelFile(self.output_file)
+        df = pd.read_excel(xl, "3_RAW_DATA_CHECKED")
+        self.assertIn("P [Pa]", df.columns)
+        self.assertIn("T [K]", df.columns)
+        self.assertIn("flowrate [mol/s]", df.columns)
+        self.assertIn("Water", df.columns)
+
+    def test_schema_validation_passes(self):
+        validator = ProcessForgeValidator()
+        issues = validator._validate_against_schema(self.store_path, self.schema)
+        self.assertEqual(issues, [])
+
+    def test_schema_validation_fails_missing_stream(self):
+        bad = dict(self.schema)
+        bad["streams"] = dict(bad["streams"])
+        bad["streams"]["nonexistent"] = {
+            "variables": ["P", "T"],
+            "dtypes": {"P": "float64", "T": "float64"},
+            "units": {"P": "Pa", "T": "K"},
+            "has_time": False,
+            "has_phase": False,
+        }
+        validator = ProcessForgeValidator()
+        issues = validator._validate_against_schema(self.store_path, bad)
+        self.assertTrue(any("nonexistent" in i for i in issues))
+
+    def test_schema_validation_fails_missing_variable(self):
+        bad = dict(self.schema)
+        bad["streams"] = dict(bad["streams"])
+        bad["streams"]["feed"] = dict(bad["streams"]["feed"])
+        bad["streams"]["feed"]["variables"] = [
+            "P",
+            "T",
+            "flowrate",
+            "Water",
+            "ExtraVar",
+        ]
+        bad["streams"]["feed"]["dtypes"]["ExtraVar"] = "float64"
+        bad["streams"]["feed"]["units"]["ExtraVar"] = ""
+        validator = ProcessForgeValidator()
+        issues = validator._validate_against_schema(self.store_path, bad)
+        self.assertTrue(any("ExtraVar" in i for i in issues))
+
+    def test_schema_info_sheet_present(self):
+        validator = ProcessForgeValidator()
+        validator.generate_validation_excel(self.store_path, self.output_file)
+        xl = pd.ExcelFile(self.output_file)
+        self.assertIn("0_SCHEMA_INFO", xl.sheet_names)
+        info = pd.read_excel(xl, "0_SCHEMA_INFO")
+        self.assertIn("Mode", info["Property"].values)
+        self.assertIn("ProcessForge Version", info["Property"].values)
+
+    def test_schema_summary_shows_compliance(self):
+        validator = ProcessForgeValidator()
+        validator.generate_validation_excel(self.store_path, self.output_file)
+        xl = pd.ExcelFile(self.output_file)
+        summary = pd.read_excel(xl, "1_EXECUTIVE_SUMMARY")
+        self.assertIn("Schema Compliance", summary["Physical Law"].values)
+
+    def test_directory_with_schema_discovery(self):
+        """Parent directory with .zarr store and .schema.json is auto-discovered."""
+        parent = tempfile.mkdtemp(dir=self.test_dir)
+        store_name = "discovery_test.zarr"
+        store_path = os.path.join(parent, store_name)
+
+        store = zarr.storage.LocalStore(store_path)
+        root = zarr.open_group(store=store, mode='w')
+        s = root.create_group("mystream")
+        s.create_array("P", data=np.array([101325.0]))
+        s.create_array("T", data=np.array([300.0]))
+        s.create_array("flowrate", data=np.array([10.0]))
+
+        schema = {
+            "version": 1,
+            "mode": "steady",
+            "streams": {
+                "mystream": {
+                    "variables": ["P", "T", "flowrate"],
+                    "dtypes": {
+                        "P": "float64",
+                        "T": "float64",
+                        "flowrate": "float64",
+                    },
+                    "units": {"P": "Pa", "T": "K", "flowrate": "mol/s"},
+                    "has_time": False,
+                    "has_phase": False,
+                },
+            },
+        }
+        with open(store_path + ".schema.json", "w") as f:
+            json.dump(schema, f)
+
+        output = os.path.join(self.test_dir, "discovery.xlsx")
+        validator = ProcessForgeValidator()
+        validator.generate_validation_excel(parent, output)
+        self.assertTrue(os.path.exists(output))
+
+        xl = pd.ExcelFile(output)
+        self.assertIn("0_SCHEMA_INFO", xl.sheet_names)
+        df = pd.read_excel(xl, "3_RAW_DATA_CHECKED")
+        self.assertIn("P [Pa]", df.columns)
+
+    def test_directory_schema_missing_store_raises(self):
+        """A schema file with no matching .zarr directory raises FileNotFoundError."""
+        parent = tempfile.mkdtemp(dir=self.test_dir)
+        schema_path = os.path.join(parent, "missing_store.zarr.schema.json")
+        with open(schema_path, "w") as f:
+            json.dump({"version": 1, "streams": {}}, f)
+        output = os.path.join(self.test_dir, "dummy.xlsx")
+        validator = ProcessForgeValidator()
+        with self.assertRaises(FileNotFoundError):
+            validator.generate_validation_excel(parent, output)
+
+    def test_directory_multiple_schemas_raises(self):
+        """Multiple schema files in a directory raise a clear error."""
+        parent = tempfile.mkdtemp(dir=self.test_dir)
+        for name in ["a.zarr.schema.json", "b.zarr.schema.json"]:
+            with open(os.path.join(parent, name), "w") as f:
+                json.dump({"version": 1, "streams": {}}, f)
+        output = os.path.join(self.test_dir, "dummy.xlsx")
+        validator = ProcessForgeValidator()
+        with self.assertRaises(ValueError):
+            validator.generate_validation_excel(parent, output)
+
+    def test_backward_compatibility_no_schema(self):
+        """Fallback path works when no schema file exists alongside a zarr store."""
+        no_schema_dir = tempfile.mkdtemp(dir=self.test_dir)
+        store_path = os.path.join(no_schema_dir, "nostore.zarr")
+        store = zarr.storage.LocalStore(store_path)
+        root = zarr.open_group(store=store, mode='w')
+        root.attrs["mode"] = "steady"
+        s = root.create_group("s1")
+        s.create_array("T [K]", data=np.array([300.0]))
+        s.create_array("P [Pa]", data=np.array([101325.0]))
+        s.create_array("flowrate", data=np.array([10.0]))
+        comp = s.create_group("__composition__")
+        comp.create_array("Water", data=np.array([1.0]))
+
+        output = os.path.join(self.test_dir, "backward.xlsx")
+        validator = ProcessForgeValidator()
+        validator.generate_validation_excel(store_path, output)
+        self.assertTrue(os.path.exists(output))
+
 
 if __name__ == "__main__":
     unittest.main()
