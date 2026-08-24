@@ -11,11 +11,9 @@ import glob
 
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 import zarr
 import boto3
 import requests
-import json
 
 
 # helper utilities -----------------------------------------------------------
@@ -112,13 +110,6 @@ def _load_streams_from_zarr(store_path: str) -> tuple[dict, str]:
         if not arrays:
             # Solver-unit groups contain only attributes.
             continue
-
-        composition = set(group.attrs.get("composition", []))
-        if not composition:
-            # Infer composition from arrays that are not known stream scalars.
-            composition = {
-                k for k in arrays if k not in _KNOWN_STREAM_SCALAR_KEYS
-            }
 
         data = {}
         for key in arrays:
@@ -371,13 +362,14 @@ class ProcessForgeValidator:
             stream_defs = schema.get("streams", {})
             rows = []
             comp_set = set()
-            std_vars = {"P", "T", "flowrate", "Phase", "VaporFrac"}
 
             for stream_name in sorted(stream_defs):
                 info = stream_defs[stream_name]
                 variables = info.get("variables", [])
                 has_time = info.get("has_time", False)
-                comp_names = sorted(v for v in variables if v not in std_vars)
+                comp_names = sorted(
+                    v for v in variables if v not in _KNOWN_STREAM_SCALAR_KEYS
+                )
                 comp_set.update(comp_names)
 
                 group = root.get(stream_name)
@@ -470,33 +462,40 @@ class ProcessForgeValidator:
         output_filename: path for the output .xlsx file.
         """
         schema = None
+        store_path = None
         if isinstance(data_source, str) and os.path.isdir(data_source):
-            schema_files = sorted(
-                glob.glob(os.path.join(data_source, "*.schema.json"))
-            )
-            if len(schema_files) == 0:
-                # No schemas found inside the directory.  Fall back to
-                # looking for a sidecar schema alongside data_source
-                # (backward compat for direct .zarr paths).
-                schema = _load_schema(data_source)
-                store_path = data_source
-            elif len(schema_files) == 1:
-                schema_path = schema_files[0]
-                basename = os.path.basename(schema_path)
-                store_name = basename.removesuffix(".schema.json")
-                store_path = os.path.join(data_source, store_name)
-                schema = _load_schema(store_path)
-                if not os.path.isdir(store_path):
-                    raise FileNotFoundError(
-                        f"Schema {basename} expects a Zarr store at "
-                        f"{store_name}, but that directory does not exist."
-                    )
+            if _is_pfarchive(data_source):
+                # Unified ProcessStateArchive directory: load via the
+                # archive-aware reader (no sidecar schema.json applies).
+                df = self._load_dataframe(data_source)
+                schema = None
             else:
-                raise ValueError(
-                    f"Multiple schema files found in {data_source}. "
-                    f"Please point directly to the desired .zarr directory."
+                schema_files = sorted(
+                    glob.glob(os.path.join(data_source, "*.schema.json"))
                 )
-            df = self._load_dataframe_from_zarr(store_path, schema=schema)
+                if len(schema_files) == 0:
+                    # No schemas found inside the directory.  Fall back to
+                    # looking for a sidecar schema alongside data_source
+                    # (backward compat for direct .zarr paths).
+                    schema = _load_schema(data_source)
+                    store_path = data_source
+                elif len(schema_files) == 1:
+                    schema_path = schema_files[0]
+                    basename = os.path.basename(schema_path)
+                    store_name = basename.removesuffix(".schema.json")
+                    store_path = os.path.join(data_source, store_name)
+                    schema = _load_schema(store_path)
+                    if not os.path.isdir(store_path):
+                        raise FileNotFoundError(
+                            f"Schema {basename} expects a Zarr store at "
+                            f"{store_name}, but that directory does not exist."
+                        )
+                else:
+                    raise ValueError(
+                        f"Multiple schema files found in {data_source}. "
+                        f"Please point directly to the desired .zarr directory."
+                    )
+                df = self._load_dataframe_from_zarr(store_path, schema=schema)
         elif isinstance(data_source, str):
             df = pd.read_csv(data_source)
         else:
@@ -530,7 +529,7 @@ class ProcessForgeValidator:
             known_cols = {"time", "stream"}
             for s_info in schema.get("streams", {}).values():
                 for var, unit in s_info.get("units", {}).items():
-                    if var in ("P", "T", "flowrate", "Phase", "VaporFrac"):
+                    if var in ("P", "T", "flowrate", "phase", "VaporFrac"):
                         known_cols.add(f"{var} [{unit}]" if unit else var)
         else:
             known_cols = {

@@ -129,6 +129,112 @@ class TestProcessForgeValidatorPfarchive(unittest.TestCase):
         self.assertEqual(mass_row["Status"], "FAIL")
 
 
+class TestProcessForgeValidatorSchema(unittest.TestCase):
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.store_path = os.path.join(self.test_dir, "test_store.zarr")
+        self.schema_path = self.store_path + ".schema.json"
+        self.output_file = os.path.join(self.test_dir, "validation.xlsx")
+
+        # Build a zarr store with both stream scalars (incl. lowercase
+        # "phase" and "time") and a real composition component ("Water").
+        store = zarr.storage.LocalStore(self.store_path)
+        root = zarr.open_group(store=store)
+        root.attrs["mode"] = "steady"
+
+        def _make_stream(group, t, p, water_frac):
+            group.create_array("T", data=np.array([t]))
+            group.create_array("P", data=np.array([p]))
+            group.create_array("phase", data=np.array(["Liquid"], dtype="<U10"))
+            group.create_array("VaporFrac", data=np.array([0.0]))
+            group.create_array("flowrate", data=np.array([10.0]))
+            group.create_array("Water", data=np.array([water_frac]))
+            group.attrs["composition"] = ["Water"]
+
+        s1 = root.create_group("stream1")
+        _make_stream(s1, 300.0, 101325.0, 1.0)
+        s2 = root.create_group("stream2_after_pump")
+        _make_stream(s2, 305.0, 200000.0, 1.0)
+        s3 = root.create_group("stream3")
+        _make_stream(s3, 300.0, 101325.0, 0.5)
+
+        # A ResultSchema-shaped sidecar describing the store.  Includes the
+        # scalar "phase" variable, which must NOT be treated as a component.
+        schema = {
+            "version": 1,
+            "store_type": "simulation_results",
+            "created": "2026-01-01T00:00:00+00:00",
+            "mode": "steady",
+            "processforge_version": "0.3.15",
+            "provenance": {"backend": "scipy", "git_hash": "abc123"},
+            "streams": {
+                name: {
+                    "variables": [
+                        "T",
+                        "P",
+                        "phase",
+                        "VaporFrac",
+                        "flowrate",
+                        "Water",
+                    ],
+                    "dtypes": {},
+                    "units": {
+                        "T": "K",
+                        "P": "Pa",
+                        "flowrate": "mol/s",
+                        "Water": "",
+                    },
+                    "shape": [1, 6],
+                    "has_time": False,
+                    "has_phase": True,
+                }
+                for name in ("stream1", "stream2_after_pump", "stream3")
+            },
+            "solver_units": {},
+        }
+        with open(self.schema_path, "w", encoding="utf-8") as f:
+            json.dump(schema, f)
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir)
+
+    def test_schema_driven_components(self):
+        # Point at the directory holding both the .zarr and .schema.json.
+        validator = ProcessForgeValidator()
+        df = validator._load_dataframe_from_zarr(self.store_path, schema=json.load(open(self.schema_path)))
+
+        self.assertEqual(df.attrs["components"], ["Water"])
+        self.assertIn("Water", df.columns)
+        self.assertIn("phase", df.columns)
+        # Scalars / metadata must not leak into the composition set.
+        self.assertNotIn("phase", df.attrs["components"])
+        self.assertNotIn("time", df.attrs["components"])
+        self.assertNotIn("T", df.attrs["components"])
+
+    def test_schema_driven_report(self):
+        validator = ProcessForgeValidator()
+        validator.generate_validation_excel(self.test_dir, self.output_file)
+        self.assertTrue(os.path.exists(self.output_file))
+
+        xl = pd.ExcelFile(self.output_file)
+        self.assertIn("0_SCHEMA_INFO", xl.sheet_names)
+        self.assertIn("1_EXECUTIVE_SUMMARY", xl.sheet_names)
+        self.assertIn("3_RAW_DATA_CHECKED", xl.sheet_names)
+
+        summary = pd.read_excel(xl, "1_EXECUTIVE_SUMMARY")
+        comp = summary[summary["Physical Law"] == "Conservation of Mass"].iloc[0]
+        self.assertEqual(comp["Status"], "FAIL")  # stream3 Water=0.5
+
+        schema_row = summary[summary["Physical Law"] == "Schema Compliance"].iloc[0]
+        self.assertEqual(schema_row["Status"], "PASS")
+
+        info = pd.read_excel(xl, "0_SCHEMA_INFO")
+        self.assertEqual(
+            info[info["Property"] == "ProcessForge Version"]["Value"].iloc[0],
+            "0.3.15",
+        )
+
+
 class TestFetchZarrStore(unittest.TestCase):
     def setUp(self):
         self.test_dir = tempfile.mkdtemp()
