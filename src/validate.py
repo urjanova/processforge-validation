@@ -1,5 +1,6 @@
 from loguru import logger
 import logging
+import json
 import os
 import argparse
 import tempfile
@@ -20,6 +21,24 @@ import json
 # helper utilities -----------------------------------------------------------
 
 
+# Variables that are per-stream scalars / metadata rather than composition
+# components.  Used when a store does not explicitly tag its composition.
+_KNOWN_STREAM_SCALAR_KEYS = {
+    "time",
+    "phase",
+    "Phase",
+    "T",
+    "P",
+    "flowrate",
+    "VaporFrac",
+    "H",
+    "Cp",
+    "K_values",
+    "beta",
+    "rho",
+}
+
+
 def _ensure_parent_dir(path: str) -> None:
     """Make parent directories for *path* if they don't exist."""
     parent = os.path.dirname(path)
@@ -27,53 +46,174 @@ def _ensure_parent_dir(path: str) -> None:
         os.makedirs(parent, exist_ok=True)
 
 
-def _build_dataframe_row(group, stream, idx, comp_names, has_time):
-    """Construct a single row from a zarr group.
+def _convert_value(value):
+    """Convert numpy scalars/arrays to plain Python objects."""
+    if isinstance(value, np.ndarray):
+        if value.size == 0:
+            return ""
+        return _convert_value(value.item())
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
 
-    Parameters
-    ----------
-    group : zarr.hierarchy.Group
-        Zarr group corresponding to one stream.
-    stream : str
-        Name of the stream.
-    idx : int
-        Time index (or 0 for steady).  If ``has_time`` is False this is ignored.
-    comp_names : list[str]
-        List of component names present in ``__composition__`` sub‑group.
-    has_time : bool
-        Whether the group contains a ``time`` dataset.
+
+def _is_pfarchive(path: str) -> bool:
+    """Return True if *path* looks like a ProcessStateArchive directory."""
+    return (
+        path.endswith(".pfarchive")
+        or os.path.isdir(os.path.join(path, "outputs", "streams"))
+    )
+
+
+def _normalize_stream_data(data: dict) -> dict:
+    """Flatten the optional ``z`` composition dict into top-level columns."""
+    normalized = dict(data)
+    composition = normalized.pop("z", None)
+    if isinstance(composition, dict):
+        normalized.update(composition)
+    return normalized
+
+
+def _load_streams_from_zarr(store_path: str) -> tuple[dict, str]:
+    """Load stream result dicts from a flattened ProcessForge Zarr store.
+
+    The new (v0.3.1+) layout writes composition arrays directly in the
+    stream group and tags them with the ``composition`` group attribute.
+    Solver-unit results live in groups with no arrays (attrs only) and are
+    ignored.  If a sibling ``<store>.schema.json`` exists, it is used to
+    identify stream groups and skip solver-unit groups.
     """
-    row = {"stream": stream}
-    if has_time:
-        try:
-            row["time"] = float(group["time"][idx])
-        except Exception:
-            row["time"] = group["time"][idx]
+    store = zarr.storage.LocalStore(store_path)
+    root = zarr.open(store=store, mode="r")
+    mode = root.attrs.get("mode", "steady")
 
-    # copy all top‑level datasets except the composition group
-    for key, val in group.members():
-        if key in ("time", "__composition__"):
+    schema = None
+    schema_path = store_path + ".schema.json"
+    if os.path.isfile(schema_path):
+        try:
+            with open(schema_path, "r", encoding="utf-8") as f:
+                schema = json.load(f)
+        except Exception as exc:
+            logger.warning("Failed to read schema {}: {}", schema_path, exc)
+
+    stream_names = None
+    if schema is not None:
+        stream_names = set(schema.get("streams", {}).keys())
+
+    streams = {}
+    for name in sorted(root.group_keys()):
+        if name == "run_info":
             continue
-        try:
-            # handle indexed arrays; zarr v3 returns 0-d ndarray on scalar index
-            v = val[idx] if hasattr(val, "shape") and val.shape else val
-            row[key] = v.item() if hasattr(v, "item") else v
-        except Exception:
-            row[key] = val
+        if stream_names is not None and name not in stream_names:
+            continue
 
-    comp_group = group.get("__composition__")
-    if comp_group is not None:
-        for comp in comp_names:
-            arr = comp_group.get(comp)
-            if arr is None:
-                row[comp] = 0.0
+        group = root[name]
+        arrays = list(group.array_keys())
+        if not arrays:
+            # Solver-unit groups contain only attributes.
+            continue
+
+        composition = set(group.attrs.get("composition", []))
+        if not composition:
+            # Infer composition from arrays that are not known stream scalars.
+            composition = {
+                k for k in arrays if k not in _KNOWN_STREAM_SCALAR_KEYS
+            }
+
+        data = {}
+        for key in arrays:
+            value = group[key][:]
+            if key == "time":
+                data["time"] = value
             else:
-                try:
-                    v = arr[idx]
-                    row[comp] = v.item() if hasattr(v, "item") else v
-                except Exception:
-                    row[comp] = arr
-    return row
+                data[key] = value
+        streams[name] = data
+
+    return streams, mode
+
+
+def _load_streams_from_pfarchive(archive_path: str) -> tuple[dict, str]:
+    """Load stream result dicts from a ProcessStateArchive directory.
+
+    The canonical layout is ``<base>.pfarchive/outputs/streams/<name>.json``.
+    If stream JSONs are absent, falls back to parsing the latest
+    ``RunManifest`` in ``runs/<run_id>.json``.
+    """
+    streams_dir = os.path.join(archive_path, "outputs", "streams")
+    if os.path.isdir(streams_dir):
+        streams = {}
+        for fname in sorted(os.listdir(streams_dir)):
+            if not fname.endswith(".json"):
+                continue
+            stream_name = fname[:-5]
+            file_path = os.path.join(streams_dir, fname)
+            with open(file_path, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            streams[stream_name] = _normalize_stream_data(raw)
+
+        mode = "steady"
+        for data in streams.values():
+            time_values = data.get("time")
+            if isinstance(time_values, (list, tuple, np.ndarray)) and len(time_values) > 1:
+                mode = "dynamic"
+                break
+        return streams, mode
+
+    # Fallback: parse the latest RunManifest.
+    latest_path = os.path.join(archive_path, "latest_run")
+    runs_dir = os.path.join(archive_path, "runs")
+    if os.path.isfile(latest_path) and os.path.isdir(runs_dir):
+        with open(latest_path, encoding="utf-8") as f:
+            run_id = f.read().strip()
+        run_path = os.path.join(runs_dir, run_id + ".json")
+        if os.path.isfile(run_path):
+            with open(run_path, encoding="utf-8") as f:
+                manifest = json.load(f)
+            streams = {}
+            for stream_name, stream_out in manifest.get("streams", {}).items():
+                data = {}
+                for field in stream_out.get("fields", []):
+                    q = field.get("quantity", {})
+                    data[field["name"]] = q.get("value")
+                streams[stream_name] = _normalize_stream_data(data)
+            return streams, manifest.get("mode", "steady")
+
+    raise ValueError(f"Could not find stream results in archive: {archive_path}")
+
+
+def _streams_to_dataframe(streams: dict, mode: str) -> pd.DataFrame:
+    """Convert a ``{stream_name: {var: array|scalar}}`` mapping to a DataFrame."""
+    rows = []
+    components = set()
+
+    for stream_name, data in sorted(streams.items()):
+        time_values = data.get("time")
+        if isinstance(time_values, (list, tuple, np.ndarray)):
+            n_rows = len(time_values)
+        else:
+            n_rows = 1
+
+        for idx in range(n_rows):
+            row = {"stream": stream_name}
+            if time_values is not None:
+                row["time"] = float(time_values[idx])
+
+            for var, value in data.items():
+                if var == "time":
+                    continue
+                if isinstance(value, (list, tuple, np.ndarray)):
+                    row[var] = _convert_value(value[idx])
+                else:
+                    row[var] = _convert_value(value)
+            rows.append(row)
+
+        for var in data.keys():
+            if var not in _KNOWN_STREAM_SCALAR_KEYS:
+                components.add(var)
+
+    df = pd.DataFrame(rows)
+    df.attrs["components"] = sorted(components)
+    return df
 
 
 # utilities for fetching zarr stores ----------------------------------------
@@ -147,7 +287,7 @@ def download_zarr_from_s3(s3_url: str, dest_dir: str) -> str:
 
 
 def fetch_zarr_store(source: str | None = None):
-    """Return a local path to a Zarr store, downloading if necessary.
+    """Return a local path to a store, downloading if necessary.
 
     Parameters
     ----------
@@ -279,30 +419,17 @@ class ProcessForgeValidator:
             df.attrs["components"] = sorted(comp_set)
             return df
 
-        # Fallback: heuristic discovery using __composition__ sub-groups
-        streams = sorted(k for k in root.group_keys() if "__composition__" in root[k])
-        rows = []
-        components = set()
-        mode = root.attrs.get("mode", "steady")
-        for stream in streams:
-            group = root[stream]
-            comp_group = group.get("__composition__")
-            comp_names = sorted(comp_group.keys()) if comp_group is not None else []
-            components.update(comp_names)
-            has_time = "time" in group and mode == "dynamic"
-            length = group["time"].shape[0] if has_time else 1
-            for idx in range(length):
-                rows.append(
-                    _build_dataframe_row(group, stream, idx, comp_names, has_time)
-                )
-        df = pd.DataFrame(rows)
-        for comp in sorted(components):
-            if comp in df:
-                df[comp] = df[comp].fillna(0.0)
-            else:
-                df[comp] = 0.0
-        df.attrs["components"] = sorted(components)
-        return df
+        # Fallback: heuristic discovery of streams and composition.
+        streams, mode = _load_streams_from_zarr(store_path)
+        return _streams_to_dataframe(streams, mode)
+
+    def _load_dataframe(self, source):
+        """Load a validation DataFrame from a zarr store or .pfarchive path."""
+        if _is_pfarchive(source):
+            streams, mode = _load_streams_from_pfarchive(source)
+        else:
+            streams, mode = _load_streams_from_zarr(source)
+        return _streams_to_dataframe(streams, mode)
 
     def _validate_against_schema(self, store_path, schema):
         issues = []
@@ -412,6 +539,7 @@ class ProcessForgeValidator:
                 "T [K]",
                 "P [Pa]",
                 "Phase",
+                "phase",
                 "VaporFrac",
                 "flowrate",
             }
@@ -593,15 +721,16 @@ class ProcessForgeValidator:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Validate a ProcessForge zarr store and produce an Excel report."
+        description="Validate a ProcessForge output store and produce an Excel report."
     )
     parser.add_argument(
         "source",
         nargs="?",
         default=None,
         help=(
-            "Local directory or URL (s3://, http(s)://) pointing to a zarr store. "
-            "If omitted, LOCAL_ZARR_DIR or S3_BUCKET_NAME env vars are used."
+            "Local directory or URL (s3://, http(s)://) pointing to a zarr store "
+            "or a .pfarchive directory. If omitted, LOCAL_ZARR_DIR or "
+            "S3_BUCKET_NAME env vars are used."
         ),
     )
     parser.add_argument(
