@@ -80,33 +80,87 @@ class TestProcessForgeValidator(unittest.TestCase):
 
 
 class TestProcessForgeValidatorPfarchive(unittest.TestCase):
+    """0.6.0 layout: runs/<id>.json + results/<id>/results.zarr + latest_run."""
+
+    RUN_ID = "20260916T000000Z_abc123"
+
     def setUp(self):
         self.test_dir = tempfile.mkdtemp()
         self.archive_path = os.path.join(self.test_dir, "run.pfarchive")
         self.output_file = os.path.join(self.test_dir, "validation.xlsx")
 
-        streams_dir = os.path.join(self.archive_path, "outputs", "streams")
-        os.makedirs(streams_dir, exist_ok=True)
+        store_path = os.path.join(
+            self.archive_path, "results", self.RUN_ID, "results.zarr"
+        )
+        store = zarr.storage.LocalStore(store_path)
+        root = zarr.open_group(store=store)
+        root.attrs["mode"] = "steady"
 
-        def _stream_json(t, p, water_frac):
-            return {
-                "T": [t],
-                "P": [p],
-                "phase": ["Liquid"],
-                "VaporFrac": [0.0],
-                "flowrate": [10.0],
-                "z": {"Water": [water_frac]},
-            }
+        def _make_stream(group, t, p, water_frac):
+            group.create_array("T", data=np.array([t]))
+            group.create_array("P", data=np.array([p]))
+            group.create_array("phase", data=np.array(["Liquid"], dtype="<U10"))
+            group.create_array("VaporFrac", data=np.array([0.0]))
+            group.create_array("flowrate", data=np.array([10.0]))
+            group.create_array("Water", data=np.array([water_frac]))
+            group.attrs["composition"] = ["Water"]
 
-        for name, payload in [
-            ("stream1", _stream_json(300.0, 101325.0, 1.0)),
-            ("stream2_after_pump", _stream_json(305.0, 200000.0, 1.0)),
-            ("stream3", _stream_json(300.0, 101325.0, 0.5)),
+        for name, vals in [
+            ("stream1", (300.0, 101325.0, 1.0)),
+            ("stream2_after_pump", (305.0, 200000.0, 1.0)),
+            ("stream3", (300.0, 101325.0, 0.5)),
         ]:
-            with open(
-                os.path.join(streams_dir, f"{name}.json"), "w", encoding="utf-8"
-            ) as f:
-                json.dump(payload, f)
+            _make_stream(root.create_group(name), *vals)
+
+        # Solver-unit group (attrs only) and engine-output group must be ignored.
+        solver = root.create_group("pump_unit")
+        solver.attrs["efficiency"] = 0.8
+        engine = root.create_group("openmc_solver")
+        engine.attrs["engine"] = "openmc"
+        engine.attrs["status"] = "success"
+        engine.create_array("k_eff", data=np.array([1.05]))
+
+        schema = {
+            "version": 1,
+            "store_type": "simulation_results",
+            "created": "2026-09-16T00:00:00+00:00",
+            "mode": "steady",
+            "processforge_version": "0.6.0",
+            "provenance": {"backend": "scipy", "git_hash": "abc123"},
+            "streams": {
+                name: {
+                    "variables": [
+                        "T",
+                        "P",
+                        "phase",
+                        "VaporFrac",
+                        "flowrate",
+                        "Water",
+                    ],
+                    "dtypes": {},
+                    "units": {"T": "K", "P": "Pa", "flowrate": "mol/s"},
+                    "shape": [1, 6],
+                    "has_time": False,
+                    "has_phase": True,
+                }
+                for name in ("stream1", "stream2_after_pump", "stream3")
+            },
+            "solver_units": {"pump_unit": {"variables": ["efficiency"], "dtypes": {}}},
+        }
+        with open(store_path + ".schema.json", "w", encoding="utf-8") as f:
+            json.dump(schema, f)
+
+        runs_dir = os.path.join(self.archive_path, "runs")
+        os.makedirs(runs_dir, exist_ok=True)
+        with open(
+            os.path.join(runs_dir, self.RUN_ID + ".json"), "w", encoding="utf-8"
+        ) as f:
+            json.dump(
+                {"run_id": self.RUN_ID, "mode": "steady", "streams": {}, "units": {}},
+                f,
+            )
+        with open(os.path.join(self.archive_path, "latest_run"), "w") as f:
+            f.write(self.RUN_ID)
 
     def tearDown(self):
         shutil.rmtree(self.test_dir)
@@ -117,6 +171,24 @@ class TestProcessForgeValidatorPfarchive(unittest.TestCase):
         self.assertEqual(len(df), 3)
         self.assertIn("Water", df.columns)
         self.assertAlmostEqual(df[df["stream"] == "stream1"].iloc[0]["Water"], 1.0)
+        # Engine-output and solver-unit groups are not streams.
+        self.assertNotIn("openmc_solver", set(df["stream"]))
+        self.assertNotIn("pump_unit", set(df["stream"]))
+        self.assertNotIn("k_eff", df.columns)
+
+    def test_pfarchive_explicit_run(self):
+        validator = ProcessForgeValidator()
+        df, schema, manifest, resolved, store = validator._load_archive_bundle(
+            self.archive_path, run_id=self.RUN_ID
+        )
+        self.assertEqual(resolved, self.RUN_ID)
+        self.assertEqual(schema["processforge_version"], "0.6.0")
+        self.assertEqual(len(df), 3)
+
+    def test_pfarchive_missing_run_errors(self):
+        validator = ProcessForgeValidator()
+        with self.assertRaises(FileNotFoundError):
+            validator._load_archive_bundle(self.archive_path, run_id="nope")
 
     def test_pfarchive_report_generation(self):
         validator = ProcessForgeValidator()
@@ -124,9 +196,12 @@ class TestProcessForgeValidatorPfarchive(unittest.TestCase):
         self.assertTrue(os.path.exists(self.output_file))
 
         xl = pd.ExcelFile(self.output_file)
+        self.assertIn("0_SCHEMA_INFO", xl.sheet_names)
         summary = pd.read_excel(xl, "1_EXECUTIVE_SUMMARY")
         mass_row = summary[summary["Physical Law"] == "Conservation of Mass"].iloc[0]
         self.assertEqual(mass_row["Status"], "FAIL")
+        comp_row = summary[summary["Physical Law"] == "Schema Compliance"].iloc[0]
+        self.assertEqual(comp_row["Status"], "PASS")
 
 
 class TestProcessForgeValidatorSchema(unittest.TestCase):

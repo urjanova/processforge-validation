@@ -28,6 +28,9 @@ _KNOWN_STREAM_SCALAR_KEYS = {
     "T",
     "P",
     "flowrate",
+    "flow",
+    "power",
+    "unit",
     "VaporFrac",
     "H",
     "Cp",
@@ -56,43 +59,104 @@ def _convert_value(value):
 
 
 def _is_pfarchive(path: str) -> bool:
-    """Return True if *path* looks like a ProcessStateArchive directory."""
-    return (
-        path.endswith(".pfarchive")
-        or os.path.isdir(os.path.join(path, "outputs", "streams"))
+    """Return True if *path* looks like a 0.6.0 ProcessStateArchive directory.
+
+    Layout: ``runs/<run_id>.json`` + ``results/<run_id>/results.zarr`` +
+    ``latest_run`` pointer.  No legacy fallbacks (``outputs/streams``,
+    ``index.json``, ``artifacts.json``, root ``results.zarr`` symlink).
+    """
+    if not isinstance(path, str) or not os.path.isdir(path):
+        return False
+    if os.path.isfile(os.path.join(path, "latest_run")):
+        return True
+    if os.path.isdir(os.path.join(path, "runs")):
+        return True
+    if os.path.isdir(os.path.join(path, "results")):
+        return True
+    return path.endswith(".pfarchive") and os.path.isdir(path)
+
+
+def _read_json_file(path: str):
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _list_runs(archive_path: str) -> list[str]:
+    """Return sorted run ids from ``runs/*.json`` (empty list if none)."""
+    runs_dir = os.path.join(archive_path, "runs")
+    if not os.path.isdir(runs_dir):
+        return []
+    return sorted(
+        p[:-5] for p in os.listdir(runs_dir) if p.endswith(".json")
     )
 
 
-def _normalize_stream_data(data: dict) -> dict:
-    """Flatten the optional ``z`` composition dict into top-level columns."""
-    normalized = dict(data)
-    composition = normalized.pop("z", None)
-    if isinstance(composition, dict):
-        normalized.update(composition)
-    return normalized
+def _resolve_archive_run(
+    archive_path: str, run_id: str | None = None
+) -> tuple[str, dict | None, dict | None, str]:
+    """Resolve a run inside a 0.6.0 ``.pfarchive`` to its Zarr store.
 
-
-def _load_streams_from_zarr(store_path: str) -> tuple[dict, str]:
-    """Load stream result dicts from a flattened ProcessForge Zarr store.
-
-    The new (v0.3.1+) layout writes composition arrays directly in the
-    stream group and tags them with the ``composition`` group attribute.
-    Solver-unit results live in groups with no arrays (attrs only) and are
-    ignored.  If a sibling ``<store>.schema.json`` exists, it is used to
-    identify stream groups and skip solver-unit groups.
+    Returns ``(store_path, schema, manifest, run_id)`` where ``store_path``
+    is ``results/<run_id>/results.zarr`` — the single source of truth for
+    time-series data.  ``schema`` is the ``results.zarr.schema.json``
+    sidecar (or ``None``), ``manifest`` the parsed ``runs/<run_id>.json``
+    (or ``None`` if unreadable).
     """
+    requested = (run_id or "").strip()
+    if not requested or requested == "latest":
+        latest_path = os.path.join(archive_path, "latest_run")
+        if not os.path.isfile(latest_path):
+            available = _list_runs(archive_path)
+            raise FileNotFoundError(
+                f"No 'latest_run' pointer in archive: {archive_path}. "
+                f"Available runs: {available or 'none'}."
+            )
+        with open(latest_path, encoding="utf-8") as f:
+            requested = f.read().strip()
+    if not requested:
+        raise ValueError(f"Empty run id for archive: {archive_path}")
+
+    store_path = os.path.join(archive_path, "results", requested, "results.zarr")
+    if not os.path.isdir(store_path):
+        available = _list_runs(archive_path)
+        raise FileNotFoundError(
+            f"Results store for run '{requested}' not found: {store_path}. "
+            f"Available runs: {available or 'none'}."
+        )
+
+    schema = _load_schema(store_path)
+
+    manifest = None
+    manifest_path = os.path.join(archive_path, "runs", requested + ".json")
+    if os.path.isfile(manifest_path):
+        try:
+            manifest = _read_json_file(manifest_path)
+        except Exception as exc:
+            logger.warning("Failed to read manifest {}: {}", manifest_path, exc)
+    else:
+        logger.warning("Manifest not found for run '{}': {}", requested, manifest_path)
+
+    return store_path, schema, manifest, requested
+
+
+def _load_streams_from_zarr(
+    store_path: str, schema: dict | None = None
+) -> tuple[dict, str]:
+    """Load stream result dicts from a 0.6.0 ProcessForge Zarr store.
+
+    Single open of the store.  Stream groups are those with arrays and no
+    ``engine`` group attribute; solver-unit groups (attrs only) and
+    engine-output groups (``engine`` attr set, e.g. OpenMC/FESTIM) are
+    skipped.  When *schema* (or its ``<store>.schema.json`` sidecar) is
+    available, discovery is restricted to ``schema["streams"]`` keys.
+    Each array is sliced exactly once.
+    """
+    if schema is None:
+        schema = _load_schema(store_path)
+
     store = zarr.storage.LocalStore(store_path)
     root = zarr.open(store=store, mode="r")
     mode = root.attrs.get("mode", "steady")
-
-    schema = None
-    schema_path = store_path + ".schema.json"
-    if os.path.isfile(schema_path):
-        try:
-            with open(schema_path, "r", encoding="utf-8") as f:
-                schema = json.load(f)
-        except Exception as exc:
-            logger.warning("Failed to read schema {}: {}", schema_path, exc)
 
     stream_names = None
     if schema is not None:
@@ -106,6 +170,9 @@ def _load_streams_from_zarr(store_path: str) -> tuple[dict, str]:
             continue
 
         group = root[name]
+        if dict(group.attrs).get("engine"):
+            # Engine-output group (e.g. OpenMC/FESTIM), not a stream.
+            continue
         arrays = list(group.array_keys())
         if not arrays:
             # Solver-unit groups contain only attributes.
@@ -113,63 +180,49 @@ def _load_streams_from_zarr(store_path: str) -> tuple[dict, str]:
 
         data = {}
         for key in arrays:
-            value = group[key][:]
-            if key == "time":
-                data["time"] = value
-            else:
-                data[key] = value
+            data[key] = group[key][:]
         streams[name] = data
 
     return streams, mode
 
 
-def _load_streams_from_pfarchive(archive_path: str) -> tuple[dict, str]:
-    """Load stream result dicts from a ProcessStateArchive directory.
+def _load_streams_from_pfarchive(
+    archive_path: str, run_id: str | None = None
+) -> tuple[dict, str, dict | None, dict | None, str, str]:
+    """Load stream results from a 0.6.0 ``.pfarchive``.
 
-    The canonical layout is ``<base>.pfarchive/outputs/streams/<name>.json``.
-    If stream JSONs are absent, falls back to parsing the latest
-    ``RunManifest`` in ``runs/<run_id>.json``.
+    Resolves ``run_id`` (default: ``latest``) to
+    ``results/<run_id>/results.zarr`` and loads streams from that store.
+    Returns ``(streams, mode, schema, manifest, run_id, store_path)``.
+    No legacy fallbacks: a missing per-run store is a hard error.
     """
-    streams_dir = os.path.join(archive_path, "outputs", "streams")
-    if os.path.isdir(streams_dir):
-        streams = {}
-        for fname in sorted(os.listdir(streams_dir)):
-            if not fname.endswith(".json"):
-                continue
-            stream_name = fname[:-5]
-            file_path = os.path.join(streams_dir, fname)
-            with open(file_path, "r", encoding="utf-8") as f:
-                raw = json.load(f)
-            streams[stream_name] = _normalize_stream_data(raw)
+    store_path, schema, manifest, resolved = _resolve_archive_run(
+        archive_path, run_id
+    )
+    streams, mode = _load_streams_from_zarr(store_path, schema=schema)
+    if manifest is not None and manifest.get("mode") and mode == "steady":
+        # Prefer the manifest mode only when the store carries no signal;
+        # the Zarr ``mode`` attr remains authoritative otherwise.
+        mode = manifest.get("mode", mode)
+    return streams, mode, schema, manifest, resolved, store_path
 
-        mode = "steady"
-        for data in streams.values():
-            time_values = data.get("time")
-            if isinstance(time_values, (list, tuple, np.ndarray)) and len(time_values) > 1:
-                mode = "dynamic"
-                break
-        return streams, mode
 
-    # Fallback: parse the latest RunManifest.
-    latest_path = os.path.join(archive_path, "latest_run")
-    runs_dir = os.path.join(archive_path, "runs")
-    if os.path.isfile(latest_path) and os.path.isdir(runs_dir):
-        with open(latest_path, encoding="utf-8") as f:
-            run_id = f.read().strip()
-        run_path = os.path.join(runs_dir, run_id + ".json")
-        if os.path.isfile(run_path):
-            with open(run_path, encoding="utf-8") as f:
-                manifest = json.load(f)
-            streams = {}
-            for stream_name, stream_out in manifest.get("streams", {}).items():
-                data = {}
-                for field in stream_out.get("fields", []):
-                    q = field.get("quantity", {})
-                    data[field["name"]] = q.get("value")
-                streams[stream_name] = _normalize_stream_data(data)
-            return streams, manifest.get("mode", "steady")
+def _pick_index(values, idx: int):
+    """Return element *idx* of a time-series, broadcasting length-1 constants.
 
-    raise ValueError(f"Could not find stream results in archive: {archive_path}")
+    0.6.0 stores may mix per-timestep arrays (length N) with stream-level
+    constants (length 1, e.g. a ``unit`` label).  Length-1 arrays broadcast
+    across all rows; anything shorter than ``idx + 1`` clamps to its last
+    element rather than raising ``IndexError``.
+    """
+    n = len(values)
+    if n == 0:
+        return ""
+    if idx < n:
+        return values[idx]
+    if n == 1:
+        return values[0]
+    return values[-1]
 
 
 def _streams_to_dataframe(streams: dict, mode: str) -> pd.DataFrame:
@@ -193,7 +246,7 @@ def _streams_to_dataframe(streams: dict, mode: str) -> pd.DataFrame:
                 if var == "time":
                     continue
                 if isinstance(value, (list, tuple, np.ndarray)):
-                    row[var] = _convert_value(value[idx])
+                    row[var] = _convert_value(_pick_index(value, idx))
                 else:
                     row[var] = _convert_value(value)
             rows.append(row)
@@ -238,8 +291,12 @@ def _load_schema(store_path: str) -> dict | None:
     schema_path = store_path + ".schema.json"
     if os.path.exists(schema_path):
         logger.info("Found schema: {}", schema_path)
-        with open(schema_path) as f:
-            return json.load(f)
+        try:
+            with open(schema_path, encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as exc:
+            logger.warning("Failed to read schema {}: {}", schema_path, exc)
+            return None
     return None
 
 
@@ -354,121 +411,163 @@ class ProcessForgeValidator:
         self.logger = logger or logging.getLogger(__name__)
 
     def _load_dataframe_from_zarr(self, store_path, schema=None):
+        # Single open: reuse the already-sliced stream dicts and build the
+        # DataFrame in one pass.  ``schema=None`` means "try the sidecar".
+        _sentinel = object()
+        if schema is None:
+            schema = _load_schema(store_path)
+            if schema is None:
+                schema = _sentinel  # heuristic path, no sidecar found
+        if schema is _sentinel:
+            streams, mode = _load_streams_from_zarr(store_path, schema=None)
+            return _streams_to_dataframe(streams, mode)
+
         store = zarr.storage.LocalStore(store_path)
         root = zarr.open(store=store, mode="r")
 
-        if schema is not None:
-            # Schema-driven: use schema for stream/variable discovery
-            stream_defs = schema.get("streams", {})
-            rows = []
-            comp_set = set()
+        stream_defs = schema.get("streams", {})
+        if not stream_defs:
+            # Schema without stream entries: fall back to heuristic discovery
+            # on the same open handle's data via a fresh (cheap) load.
+            streams, mode = _load_streams_from_zarr(store_path, schema=schema)
+            return _streams_to_dataframe(streams, mode)
 
-            for stream_name in sorted(stream_defs):
-                info = stream_defs[stream_name]
-                variables = info.get("variables", [])
-                has_time = info.get("has_time", False)
-                comp_names = sorted(
-                    v for v in variables if v not in _KNOWN_STREAM_SCALAR_KEYS
-                )
-                comp_set.update(comp_names)
+        rows = []
+        comp_set = set()
+        for stream_name in sorted(stream_defs):
+            info = stream_defs[stream_name]
+            variables = info.get("variables", [])
+            has_time = info.get("has_time", False)
+            comp_names = sorted(
+                v for v in variables if v not in _KNOWN_STREAM_SCALAR_KEYS
+            )
+            comp_set.update(comp_names)
 
-                group = root.get(stream_name)
-                if group is None:
-                    continue
-
-                length = group["time"].shape[0] if has_time and "time" in group else 1
-                for idx in range(length):
-                    row = {"stream": stream_name}
-                    if has_time and "time" in group:
-                        try:
-                            row["time"] = float(group["time"][idx])
-                        except Exception:
-                            row["time"] = group["time"][idx]
-
-                    for var in variables:
-                        if var == "time":
-                            continue
-                        arr = group.get(var)
-                        if arr is None:
-                            continue
-                        try:
-                            v = arr[idx] if hasattr(arr, "shape") and arr.shape else arr
-                            row[var] = v.item() if hasattr(v, "item") else v
-                        except Exception:
-                            row[var] = arr
-
-                    for comp in comp_names:
-                        row.setdefault(comp, 0.0)
-
-                    rows.append(row)
-
-            df = pd.DataFrame(rows)
-            for comp in sorted(comp_set):
-                if comp in df:
-                    df[comp] = df[comp].fillna(0.0)
-                else:
-                    df[comp] = 0.0
-            df.attrs["components"] = sorted(comp_set)
-            return df
-
-        # Fallback: heuristic discovery of streams and composition.
-        streams, mode = _load_streams_from_zarr(store_path)
-        return _streams_to_dataframe(streams, mode)
-
-    def _load_dataframe(self, source):
-        """Load a validation DataFrame from a zarr store or .pfarchive path."""
-        if _is_pfarchive(source):
-            streams, mode = _load_streams_from_pfarchive(source)
-        else:
-            streams, mode = _load_streams_from_zarr(source)
-        return _streams_to_dataframe(streams, mode)
-
-    def _validate_against_schema(self, store_path, schema):
-        issues = []
-        store = zarr.storage.LocalStore(store_path)
-        root = zarr.open(store=store, mode="r")
-
-        for stream_name in schema.get("streams", {}):
-            if stream_name not in root:
-                issues.append(f"Missing stream: '{stream_name}'")
-
-        for stream_name, stream_info in schema.get("streams", {}).items():
             if stream_name not in root:
                 continue
             group = root[stream_name]
-            for var_name in stream_info.get("variables", []):
-                if var_name not in group:
-                    issues.append(
-                        f"Stream '{stream_name}': missing variable '{var_name}'"
-                    )
+            if dict(group.attrs).get("engine"):
+                continue
 
-        zarr_mode = root.attrs.get("mode")
-        schema_mode = schema.get("mode")
-        if zarr_mode and schema_mode and zarr_mode != schema_mode:
-            issues.append(
-                f"Mode mismatch: schema='{schema_mode}', zarr='{zarr_mode}'"
-            )
+            # Slice each array once.
+            cache = {}
+            for var in variables:
+                if var == "time" and not has_time:
+                    continue
+                if var in group:
+                    try:
+                        cache[var] = group[var][:]
+                    except Exception:
+                        continue
+
+            time_values = cache.get("time") if has_time else None
+            length = len(time_values) if time_values is not None else 1
+            for idx in range(length):
+                row = {"stream": stream_name}
+                if time_values is not None:
+                    row["time"] = float(time_values[idx])
+                for var in variables:
+                    if var == "time":
+                        continue
+                    values = cache.get(var)
+                    if values is None:
+                        continue
+                    try:
+                        row[var] = _convert_value(_pick_index(values, idx))
+                    except Exception:
+                        row[var] = _convert_value(values)
+                for comp in comp_names:
+                    row.setdefault(comp, 0.0)
+                rows.append(row)
+
+        df = pd.DataFrame(rows)
+        for comp in sorted(comp_set):
+            if comp in df:
+                df[comp] = df[comp].fillna(0.0)
+            else:
+                df[comp] = 0.0
+        df.attrs["components"] = sorted(comp_set)
+        return df
+
+    def _load_archive_bundle(self, archive_path, run_id=None):
+        """Load a 0.6.0 archive run into ``(df, schema, manifest, run_id, store)``."""
+        streams, mode, schema, manifest, resolved, store_path = (
+            _load_streams_from_pfarchive(archive_path, run_id=run_id)
+        )
+        df = _streams_to_dataframe(streams, mode)
+        return df, schema, manifest, resolved, store_path
+
+    def _load_dataframe(self, source, run_id=None):
+        """Load a validation DataFrame from a zarr store or .pfarchive path."""
+        if _is_pfarchive(source):
+            df, _s, _m, _r, _p = self._load_archive_bundle(source, run_id=run_id)
+            return df
+        streams, mode = _load_streams_from_zarr(source)
+        return _streams_to_dataframe(streams, mode)
+
+    def _validate_against_schema(self, store_path, schema, root=None):
+        issues = []
+        close = False
+        if root is None:
+            store = zarr.storage.LocalStore(store_path)
+            root = zarr.open(store=store, mode="r")
+            close = True
+        try:
+            for stream_name in schema.get("streams", {}):
+                if stream_name not in root:
+                    issues.append(f"Missing stream: '{stream_name}'")
+
+            for stream_name, stream_info in schema.get("streams", {}).items():
+                if stream_name not in root:
+                    continue
+                group = root[stream_name]
+                for var_name in stream_info.get("variables", []):
+                    if var_name not in group:
+                        issues.append(
+                            f"Stream '{stream_name}': missing variable '{var_name}'"
+                        )
+
+            for unit_name in schema.get("solver_units", {}):
+                if unit_name not in root:
+                    issues.append(f"Missing solver unit: '{unit_name}'")
+
+            zarr_mode = root.attrs.get("mode")
+            schema_mode = schema.get("mode")
+            if zarr_mode and schema_mode and zarr_mode != schema_mode:
+                issues.append(
+                    f"Mode mismatch: schema='{schema_mode}', zarr='{zarr_mode}'"
+                )
+        finally:
+            if close:
+                pass  # zarr LocalStore needs no explicit close
 
         return issues
 
-    def generate_validation_excel(self, data_source, output_filename):
+    def generate_validation_excel(self, data_source, output_filename, run_id=None):
         """
         Generate a multi-sheet Excel validation report from simulation results.
 
-        data_source: path to a Zarr store or a directory containing one;
+        data_source: path to a 0.6.0 ``.pfarchive`` directory (validated run
+                     resolved via ``latest_run`` unless *run_id* is given);
+                     path to a Zarr store or a directory containing one;
                      path to a CSV file; or a pandas DataFrame.
                      When a directory is given, a ``.schema.json`` file is
                      used to discover the matching ``.zarr`` store inside it.
         output_filename: path for the output .xlsx file.
+        run_id: optional run id (or ``"latest"``) used only when
+                *data_source* is a ``.pfarchive`` directory.
         """
         schema = None
         store_path = None
+        manifest = None
+        resolved_run = None
         if isinstance(data_source, str) and os.path.isdir(data_source):
             if _is_pfarchive(data_source):
-                # Unified ProcessStateArchive directory: load via the
-                # archive-aware reader (no sidecar schema.json applies).
-                df = self._load_dataframe(data_source)
-                schema = None
+                # 0.6.0 ProcessStateArchive: per-run Zarr store is the single
+                # source of truth; its sidecar schema drives the report.
+                df, schema, manifest, resolved_run, store_path = (
+                    self._load_archive_bundle(data_source, run_id=run_id)
+                )
             else:
                 schema_files = sorted(
                     glob.glob(os.path.join(data_source, "*.schema.json"))
@@ -649,6 +748,14 @@ class ProcessForgeValidator:
                     "Status": "INFO",
                 }
             )
+            if resolved_run is not None:
+                summary_rows.append(
+                    {
+                        "Physical Law": "Validated Run",
+                        "Logic": resolved_run,
+                        "Status": "INFO",
+                    }
+                )
         summary_rows.append(
             {
                 "Physical Law": "Conservation of Mass",
@@ -688,27 +795,35 @@ class ProcessForgeValidator:
         _ensure_parent_dir(output_filename)
         with pd.ExcelWriter(output_filename, engine="openpyxl") as writer:
             if schema is not None:
-                schema_info = pd.DataFrame(
-                    [
-                        {"Property": "Mode", "Value": schema.get("mode", "")},
+                info_rows = [
+                    {"Property": "Mode", "Value": schema.get("mode", "")},
+                    {
+                        "Property": "ProcessForge Version",
+                        "Value": schema.get("processforge_version", ""),
+                    },
+                    {
+                        "Property": "Backend",
+                        "Value": schema.get("provenance", {}).get("backend", ""),
+                    },
+                    {
+                        "Property": "Git Hash",
+                        "Value": schema.get("provenance", {}).get("git_hash", ""),
+                    },
+                    {
+                        "Property": "Created",
+                        "Value": schema.get("created", ""),
+                    },
+                ]
+                if resolved_run is not None:
+                    info_rows.append({"Property": "Run ID", "Value": resolved_run})
+                if manifest is not None:
+                    info_rows.append(
                         {
-                            "Property": "ProcessForge Version",
-                            "Value": schema.get("processforge_version", ""),
-                        },
-                        {
-                            "Property": "Backend",
-                            "Value": schema.get("provenance", {}).get("backend", ""),
-                        },
-                        {
-                            "Property": "Git Hash",
-                            "Value": schema.get("provenance", {}).get("git_hash", ""),
-                        },
-                        {
-                            "Property": "Created",
-                            "Value": schema.get("created", ""),
-                        },
-                    ]
-                )
+                            "Property": "Manifest Run ID",
+                            "Value": manifest.get("run_id", resolved_run or ""),
+                        }
+                    )
+                schema_info = pd.DataFrame(info_rows)
                 schema_info.to_excel(writer, sheet_name="0_SCHEMA_INFO", index=False)
             summary_df.to_excel(writer, sheet_name="1_EXECUTIVE_SUMMARY", index=False)
             if not pump_check.empty:
@@ -728,7 +843,7 @@ def main():
         default=None,
         help=(
             "Local directory or URL (s3://, http(s)://) pointing to a zarr store "
-            "or a .pfarchive directory. If omitted, LOCAL_ZARR_DIR or "
+            "or a 0.6.0 .pfarchive directory. If omitted, LOCAL_ZARR_DIR or "
             "S3_BUCKET_NAME env vars are used."
         ),
     )
@@ -738,12 +853,20 @@ def main():
         default="validation.xlsx",
         help="path for the generated Excel file",
     )
+    parser.add_argument(
+        "--run",
+        default=None,
+        help=(
+            "Run id to validate inside a .pfarchive directory "
+            "(default: the 'latest_run' pointer)."
+        ),
+    )
     args = parser.parse_args()
 
     store_path, tmpdir = fetch_zarr_store(args.source)
     try:
         validator = ProcessForgeValidator()
-        validator.generate_validation_excel(store_path, args.output)
+        validator.generate_validation_excel(store_path, args.output, run_id=args.run)
     finally:
         if tmpdir:
             shutil.rmtree(tmpdir, ignore_errors=True)
