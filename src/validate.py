@@ -142,7 +142,7 @@ def _resolve_archive_run(
 def _load_streams_from_zarr(
     store_path: str, schema: dict | None = None
 ) -> tuple[dict, str]:
-    """Load stream result dicts from a 0.6.0 ProcessForge Zarr store.
+    """Load stream result dicts from a 0.6.0 Processforge Zarr store.
 
     Single open of the store.  Stream groups are those with arrays and no
     ``engine`` group attribute; solver-unit groups (attrs only) and
@@ -406,7 +406,7 @@ def fetch_zarr_store(source: str | None = None):
         raise ValueError(f"Unsupported URL scheme: {scheme}")
 
 
-class ProcessForgeValidator:
+class ProcessforgeValidator:
     def __init__(self, logger=None):
         self.logger = logger or logging.getLogger(__name__)
 
@@ -743,7 +743,7 @@ class ProcessForgeValidator:
             )
             summary_rows.append(
                 {
-                    "Physical Law": "ProcessForge Version",
+                    "Physical Law": "Processforge Version",
                     "Logic": schema.get("processforge_version", "unknown"),
                     "Status": "INFO",
                 }
@@ -798,7 +798,7 @@ class ProcessForgeValidator:
                 info_rows = [
                     {"Property": "Mode", "Value": schema.get("mode", "")},
                     {
-                        "Property": "ProcessForge Version",
+                        "Property": "Processforge Version",
                         "Value": schema.get("processforge_version", ""),
                     },
                     {
@@ -835,7 +835,7 @@ class ProcessForgeValidator:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Validate a ProcessForge output store and produce an Excel report."
+        description="Validate a Processforge output store and produce an Excel report."
     )
     parser.add_argument(
         "source",
@@ -865,7 +865,7 @@ def main():
 
     store_path, tmpdir = fetch_zarr_store(args.source)
     try:
-        validator = ProcessForgeValidator()
+        validator = ProcessforgeValidator()
         validator.generate_validation_excel(store_path, args.output, run_id=args.run)
     finally:
         if tmpdir:
